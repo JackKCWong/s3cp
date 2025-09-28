@@ -1,8 +1,6 @@
 module github.com/JackKCWong/s3cp
 
-go 1.24.0
-
-toolchain go1.24.7
+go 1.23.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.39.2
@@ -10,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.19.9
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.88.3
 	github.com/lmittmann/tint v1.1.2
-	golang.org/x/sync v0.17.0
+	golang.org/x/sync v0.16.0
 )
 
 require (
