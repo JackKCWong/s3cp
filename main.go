@@ -27,55 +27,181 @@ func main() {
 		Level:      slog.LevelDebug,
 		TimeFormat: time.Kitchen,
 	})))
+
 	concurrency := flag.Int("c", runtime.NumCPU()*4, "concurrency")
+	// -s now takes an integer number of minutes for the presigned URL expiry.
+	// A value > 0 enables presigning; 0 (default) means disabled.
+	signMins := flag.Int("s", 0, "generate presigned url(s) for S3 object or prefix; minutes until expiry")
 	flag.Parse()
 
-	if len(flag.Args()) != 2 {
-		slog.Info("Usage: s3cp <src> <dst>")
-		os.Exit(1)
-	}
-
-	src := flag.Arg(0)
-	dst := flag.Arg(1)
-
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		slog.Info("failed to load AWS config", "err", err)
-		os.Exit(1)
-	}
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-		o.Region = "default"
-	})
-
-	if isS3Url(src) && !isS3Url(dst) {
-		// Download
-		bucket, prefix, err := parseS3Url(src)
+	// If -s is provided (minutes > 0) we expect a single S3 url argument and will print
+	// presigned GET URLs to stdout (one per line for prefixes).
+	if *signMins > 0 {
+		if len(flag.Args()) != 1 {
+			slog.Info("Usage: s3cp -s <minutes> s3://bucket/key_or_prefix/")
+			os.Exit(1)
+		}
+		s3url := flag.Arg(0)
+		cfg, err := config.LoadDefaultConfig(context.TODO())
+		if err != nil {
+			slog.Info("failed to load AWS config", "err", err)
+			os.Exit(1)
+		}
+		client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.UsePathStyle = true
+			o.Region = "default"
+		})
+		if !isS3Url(s3url) {
+			slog.Info("invalid S3 url")
+			os.Exit(1)
+		}
+		bucket, prefix, err := parseS3Url(s3url)
 		if err != nil {
 			slog.Info("invalid S3 url", "err", err)
 			os.Exit(1)
 		}
-		err = downloadS3Prefix(client, bucket, prefix, dst, *concurrency)
-		if err != nil {
-			slog.Info("download error", "err", err)
-			os.Exit(1)
-		}
-	} else if !isS3Url(src) && isS3Url(dst) {
-		// Upload
-		bucket, prefix, err := parseS3Url(dst)
-		if err != nil {
-			slog.Info("invalid S3 url", "err", err)
-			os.Exit(1)
-		}
-		err = uploadPathToS3(client, src, bucket, prefix, *concurrency)
-		if err != nil {
-			slog.Info("upload error", "err", err)
+		if err := generatePresignedForS3(client, bucket, prefix, *signMins); err != nil {
+			slog.Info("failed to generate presigned url(s)", "err", err)
 			os.Exit(1)
 		}
 	} else {
-		slog.Info("Either source or destination must be an S3 url (s3://bucket/prefix)")
-		os.Exit(1)
+		if len(flag.Args()) != 2 {
+			slog.Info("Usage: s3cp <src> <dst>")
+			os.Exit(1)
+		}
+
+		src := flag.Arg(0)
+		dst := flag.Arg(1)
+
+		cfg, err := config.LoadDefaultConfig(context.TODO())
+		if err != nil {
+			slog.Info("failed to load AWS config", "err", err)
+			os.Exit(1)
+		}
+		client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.UsePathStyle = true
+			o.Region = "default"
+		})
+
+		if isS3Url(src) && !isS3Url(dst) {
+			// Download
+			bucket, prefix, err := parseS3Url(src)
+			if err != nil {
+				slog.Info("invalid S3 url", "err", err)
+				os.Exit(1)
+			}
+			err = downloadS3Prefix(client, bucket, prefix, dst, *concurrency)
+			if err != nil {
+				slog.Info("download error", "err", err)
+				os.Exit(1)
+			}
+		} else if !isS3Url(src) && isS3Url(dst) {
+			// Upload
+			bucket, prefix, err := parseS3Url(dst)
+			if err != nil {
+				slog.Info("invalid S3 url", "err", err)
+				os.Exit(1)
+			}
+			err = uploadPathToS3(client, src, bucket, prefix, *concurrency)
+			if err != nil {
+				slog.Info("upload error", "err", err)
+				os.Exit(1)
+			}
+		} else {
+			slog.Info("Either source or destination must be an S3 url (s3://bucket/prefix)")
+			os.Exit(1)
+		}
 	}
+
+}
+
+// generatePresignedForS3 will generate presigned GET URLs for either a single
+// object (when prefix does not end with '/') or for all objects under a
+// prefix when prefix ends with '/'. It writes one URL per line to stdout.
+func generatePresignedForS3(client *s3.Client, bucket, prefix string, mins int) error {
+	ctx := context.TODO()
+	presigner := s3.NewPresignClient(client)
+
+	// Helper to produce and print a presigned URL for a given key.
+	gen := func(key string) error {
+		req, err := presigner.PresignGetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		}, func(o *s3.PresignOptions) {
+			o.Expires = time.Duration(mins) * time.Minute
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println(req.URL)
+		return nil
+	}
+
+	// If prefix ends with a slash, treat as directory and list objects.
+	if strings.HasSuffix(prefix, "/") || prefix == "" {
+		paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(bucket),
+			Prefix: aws.String(prefix),
+		})
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				return err
+			}
+			for _, obj := range page.Contents {
+				if obj.Key == nil {
+					continue
+				}
+				if obj.Size != nil && *obj.Size == 0 {
+					// skip directory placeholders
+					continue
+				}
+				if err := gen(*obj.Key); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	// Otherwise try to head the object. If it exists, return a single presigned URL.
+	_, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(prefix),
+	})
+	if err == nil {
+		return gen(prefix)
+	}
+
+	// If HeadObject failed, fall back to listing objects with the prefix (in
+	// case the user omitted a trailing slash but intended a prefix).
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
+	})
+	found := false
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if obj.Size != nil && *obj.Size == 0 {
+				continue
+			}
+			if err := gen(*obj.Key); err != nil {
+				return err
+			}
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("no objects found for s3://%s/%s", bucket, prefix)
+	}
+	return nil
 }
 
 func isS3Url(s string) bool {
@@ -99,8 +225,8 @@ func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concu
 	slog.Info("downloading", "bucket", bucket, "prefix", prefix, "localPath", localPath, "concurrency", concurrency)
 	ctx := context.TODO()
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
+		Bucket:    aws.String(bucket),
+		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
 	})
 
