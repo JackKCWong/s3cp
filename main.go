@@ -302,8 +302,8 @@ func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concu
 	slog.Info("downloading", "bucket", bucket, "prefix", prefix, "localPath", localPath, "concurrency", concurrency)
 	ctx := context.TODO()
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket:    aws.String(bucket),
-		Prefix:    aws.String(prefix),
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
 	})
 
 	downloader := manager.NewDownloader(client)
@@ -382,15 +382,58 @@ func uploadPathToS3(client *s3.Client, localPath, bucket, prefix string, concurr
 			slog.Error("failed to access path", "path", path, "err", err)
 			return err
 		}
-		if d.IsDir() {
-			slog.Info("skipping directory", "path", path)
-			return nil
-		}
+
 		rel, err := filepath.Rel(localPath, path)
 		if err != nil {
 			slog.Error("failed to get relative path", "path", path, "err", err)
 			return err
 		}
+		if rel == "." {
+			rel = ""
+		}
+
+		// If this is a directory, create a 0-byte "placeholder" object with a
+		// trailing slash to mimic a filesystem tree in S3. Skip creating a
+		// placeholder for the root when both prefix and rel are empty.
+		if d.IsDir() {
+			key := filepath.ToSlash(filepath.Join(prefix, rel))
+			if key == "" {
+				// nothing to upload for the workspace root
+				slog.Info("skipping root directory placeholder", "path", path)
+				return nil
+			}
+			if !strings.HasSuffix(key, "/") {
+				key = key + "/"
+			}
+
+			err = sem.Acquire(context.Background(), 1)
+			if err != nil {
+				slog.Error("failed to acquire semaphore", "err", err)
+				return err
+			}
+
+			wg.Add(1)
+			go func(key string) {
+				defer wg.Done()
+				defer sem.Release(1)
+
+				slog.Info("creating directory placeholder", "s3", fmt.Sprintf("%s/%s", bucket, key))
+				_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String(key),
+					Body:   strings.NewReader(""),
+				})
+				if err != nil {
+					slog.Error("failed to create directory placeholder", "s3", fmt.Sprintf("%s/%s", bucket, key), "err", err)
+				} else {
+					slog.Info("created directory placeholder", "s3", fmt.Sprintf("%s/%s", bucket, key))
+				}
+			}(key)
+
+			return nil
+		}
+
+		// It's a file: upload as before.
 		key := filepath.ToSlash(filepath.Join(prefix, rel))
 		err = sem.Acquire(context.Background(), 1)
 		if err != nil {
@@ -400,12 +443,13 @@ func uploadPathToS3(client *s3.Client, localPath, bucket, prefix string, concurr
 
 		slog.Info("file uploading", "file", path, "s3", fmt.Sprintf("%s/%s", bucket, key))
 		wg.Add(1)
-		go func() error {
+		go func(path, key string) {
 			defer wg.Done()
 			defer sem.Release(1)
 			f, err := os.Open(path)
 			if err != nil {
-				return err
+				slog.Error("failed to open file", "file", path, "err", err)
+				return
 			}
 			defer f.Close()
 
@@ -416,12 +460,11 @@ func uploadPathToS3(client *s3.Client, localPath, bucket, prefix string, concurr
 			})
 			if err != nil {
 				slog.Error("failed to upload", "file", path, "s3", fmt.Sprintf("%s/%s", bucket, key), "err", err)
-				return err
+				return
 			}
 
 			slog.Info("file uploaded", "file", path, "s3", fmt.Sprintf("%s/%s", bucket, key))
-			return nil
-		}()
+		}(path, key)
 
 		return nil
 	})
