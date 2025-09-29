@@ -304,7 +304,6 @@ func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concu
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucket),
 		Prefix:    aws.String(prefix),
-		Delimiter: aws.String("/"),
 	})
 
 	downloader := manager.NewDownloader(client)
