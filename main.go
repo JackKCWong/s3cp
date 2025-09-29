@@ -65,14 +65,8 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		if len(flag.Args()) != 2 {
-			slog.Info("Usage: s3cp <src> <dst>")
-			os.Exit(1)
-		}
-
-		src := flag.Arg(0)
-		dst := flag.Arg(1)
-
+		args := flag.Args()
+		// Create AWS client early so listing mode can use it.
 		cfg, err := config.LoadDefaultConfig(context.TODO())
 		if err != nil {
 			slog.Info("failed to load AWS config", "err", err)
@@ -82,6 +76,29 @@ func main() {
 			o.UsePathStyle = true
 			o.Region = "default"
 		})
+
+		// Support a single-argument s3 listing mode: `s3cp s3://bucket/prefix/`
+		if len(args) == 1 && isS3Url(args[0]) {
+			s3url := args[0]
+			bucket, prefix, err := parseS3Url(s3url)
+			if err != nil {
+				slog.Info("invalid S3 url", "err", err)
+				os.Exit(1)
+			}
+			if err := listS3Prefix(client, bucket, prefix); err != nil {
+				slog.Info("list error", "err", err)
+				os.Exit(1)
+			}
+			return
+		}
+
+		if len(args) != 2 {
+			slog.Info("Usage: s3cp <src> <dst>")
+			os.Exit(1)
+		}
+
+		src := args[0]
+		dst := args[1]
 
 		if isS3Url(src) && !isS3Url(dst) {
 			// Download
@@ -219,6 +236,76 @@ func parseS3Url(s string) (bucket, prefix string, err error) {
 		prefix = parts[1]
 	}
 	return
+}
+
+// listS3Prefix prints one s3://bucket/key line per object found under the
+// given prefix. If prefix is an exact object key (no trailing slash) it will
+// attempt a HeadObject and print that single key. If prefix ends with '/' or
+// the HeadObject fails, it will list objects with the prefix and print them.
+func listS3Prefix(client *s3.Client, bucket, prefix string) error {
+	ctx := context.TODO()
+
+	// If prefix ends with a slash, treat as directory and list objects.
+	if strings.HasSuffix(prefix, "/") || prefix == "" {
+		paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(bucket),
+			Prefix: aws.String(prefix),
+		})
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				return err
+			}
+			for _, obj := range page.Contents {
+				if obj.Key == nil {
+					continue
+				}
+				if obj.Size != nil && *obj.Size == 0 {
+					// skip directory placeholders
+					continue
+				}
+				fmt.Printf("s3://%s/%s\n", bucket, *obj.Key)
+			}
+		}
+		return nil
+	}
+
+	// Otherwise try to head the object. If it exists, print it.
+	_, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(prefix),
+	})
+	if err == nil {
+		fmt.Printf("s3://%s/%s\n", bucket, prefix)
+		return nil
+	}
+
+	// Fall back to listing objects with the prefix (in case the user omitted a trailing slash).
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(prefix),
+	})
+	found := false
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if obj.Size != nil && *obj.Size == 0 {
+				continue
+			}
+			fmt.Printf("s3://%s/%s\n", bucket, *obj.Key)
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("no objects found for s3://%s/%s", bucket, prefix)
+	}
+	return nil
 }
 
 func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concurrency int) error {
