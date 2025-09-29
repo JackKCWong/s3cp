@@ -245,42 +245,6 @@ func parseS3Url(s string) (bucket, prefix string, err error) {
 func listS3Prefix(client *s3.Client, bucket, prefix string) error {
 	ctx := context.TODO()
 
-	// If prefix ends with a slash, treat as directory and list objects.
-	if strings.HasSuffix(prefix, "/") || prefix == "" {
-		paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-			Bucket: aws.String(bucket),
-			Prefix: aws.String(prefix),
-		})
-		for paginator.HasMorePages() {
-			page, err := paginator.NextPage(ctx)
-			if err != nil {
-				return err
-			}
-			for _, obj := range page.Contents {
-				if obj.Key == nil {
-					continue
-				}
-				if obj.Size != nil && *obj.Size == 0 {
-					// skip directory placeholders
-					continue
-				}
-				fmt.Printf("s3://%s/%s\n", bucket, *obj.Key)
-			}
-		}
-		return nil
-	}
-
-	// Otherwise try to head the object. If it exists, print it.
-	_, err := client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(prefix),
-	})
-	if err == nil {
-		fmt.Printf("s3://%s/%s\n", bucket, prefix)
-		return nil
-	}
-
-	// Fall back to listing objects with the prefix (in case the user omitted a trailing slash).
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 		Prefix: aws.String(prefix),
@@ -296,9 +260,20 @@ func listS3Prefix(client *s3.Client, bucket, prefix string) error {
 				continue
 			}
 			if obj.Size != nil && *obj.Size == 0 {
+				// skip directory placeholders
 				continue
 			}
-			fmt.Printf("s3://%s/%s\n", bucket, *obj.Key)
+			size := int64(0)
+			if obj.Size != nil {
+				size = *obj.Size
+			}
+			var lastModTime string
+			if obj.LastModified != nil {
+				lastModTime = obj.LastModified.UTC().Format(time.RFC3339)
+			} else {
+				lastModTime = "-"
+			}
+			fmt.Printf("%s\t%s\ts3://%s/%s\n", lastModTime, humanSize(size), bucket, *obj.Key)
 			found = true
 		}
 	}
@@ -306,6 +281,21 @@ func listS3Prefix(client *s3.Client, bucket, prefix string) error {
 		return fmt.Errorf("no objects found for s3://%s/%s", bucket, prefix)
 	}
 	return nil
+}
+
+// humanSize converts bytes into a human-friendly string using 1024 base.
+func humanSize(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%dB", bytes)
+	}
+	units := []string{"B", "K", "M", "G", "T", "P"}
+	f := float64(bytes)
+	idx := 0
+	for f >= 1024 && idx < len(units)-1 {
+		f /= 1024
+		idx++
+	}
+	return fmt.Sprintf("%.0f%s", f, units[idx])
 }
 
 func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concurrency int) error {
