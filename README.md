@@ -16,6 +16,7 @@ s3cp [flags] <src> <dst>
 
 - Either `<src>` or `<dst>` must be an S3 URL of the form `s3://bucket/prefix`.
 - The other must be a local file or directory path.
+- When the source is a file and the destination is a directory, the filename is automatically appended to the destination path.
 
 ### Examples
 
@@ -39,6 +40,15 @@ s3cp s3://my-bucket/data/*.csv.gz ./localdir
 
 # Download all files with a specific pattern from subdirectories
 s3cp s3://my-bucket/data/**/*.csv.gz ./localdir
+```
+
+**Automatic filename handling:**
+```
+# When downloading a specific S3 object to a local directory, the filename is automatically added:
+s3cp s3://my-bucket/file.txt ./mydir/    # Downloads to ./mydir/file.txt
+
+# When uploading a local file to an S3 directory (prefix ending with /), the filename is automatically added:
+s3cp ./myfile.txt s3://my-bucket/data/  # Uploads to s3://my-bucket/data/myfile.txt
 ```
 
 ### Flags

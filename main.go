@@ -55,13 +55,13 @@ func main() {
 			slog.Info("invalid S3 url")
 			os.Exit(1)
 		}
-		
+
 		bucket, prefix, pattern, err := parseS3UrlWithPattern(s3url)
 		if err != nil {
 			slog.Info("invalid S3 url", "err", err)
 			os.Exit(1)
 		}
-		
+
 		// If there's a glob pattern in the URL, use the pattern-aware presigned URL generation
 		if pattern != "" {
 			if err := generatePresignedForS3WithPattern(client, bucket, prefix, pattern, *signMins); err != nil {
@@ -95,7 +95,7 @@ func main() {
 				slog.Info("invalid S3 url", "err", err)
 				os.Exit(1)
 			}
-			
+
 			// If there's a glob pattern in the URL, use the pattern-aware listing function
 			if pattern != "" {
 				if err := listS3PrefixWithPattern(client, bucket, prefix, pattern); err != nil {
@@ -126,14 +126,33 @@ func main() {
 				slog.Info("invalid S3 url", "err", err)
 				os.Exit(1)
 			}
-			
+
+			// Check if we're downloading a single S3 object to a local directory
+			// If the destination is a directory and the S3 path refers to a single file (doesn't end with '/'),
+			// and there's no glob pattern, we should append the filename to the destination
+			var adjustedDst string
+			if pattern == "" && !strings.HasSuffix(prefix, "/") {
+				// This looks like a single S3 object (not a prefix/directory)
+				fi, err := os.Stat(dst)
+				if err == nil && fi.IsDir() {
+					// Destination is a directory, so append the S3 object filename
+					adjustedDst = filepath.Join(dst, filepath.Base(prefix))
+				} else {
+					// Destination is not a directory, use as is
+					adjustedDst = dst
+				}
+			} else {
+				// This is a prefix/directory operation or has a pattern, use destination as is
+				adjustedDst = dst
+			}
+
 			// If there's a glob pattern in the source, use the filtered download function
 			if pattern != "" {
-				err = downloadS3PrefixWithPattern(client, bucket, prefix, pattern, dst, *concurrency)
+				err = downloadS3PrefixWithPattern(client, bucket, prefix, pattern, adjustedDst, *concurrency)
 			} else {
-				err = downloadS3Prefix(client, bucket, prefix, dst, *concurrency)
+				err = downloadS3Prefix(client, bucket, prefix, adjustedDst, *concurrency)
 			}
-			
+
 			if err != nil {
 				slog.Info("download error", "err", err)
 				os.Exit(1)
@@ -150,7 +169,23 @@ func main() {
 				slog.Info("glob patterns not supported for upload destinations")
 				os.Exit(1)
 			}
-			err = uploadPathToS3(client, src, bucket, prefix, *concurrency)
+
+			// Check if we're uploading a local file to an S3 directory/prefix
+			// If the source is a file and the S3 destination looks like a directory (ends with '/'),
+			// we should append the filename to the S3 prefix
+			var adjustedPrefix string
+			fi, err := os.Stat(src)
+			if err == nil && !fi.IsDir() && strings.HasSuffix(prefix, "/") {
+				// Source is a file and destination is a directory/prefix, append filename
+				adjustedPrefix = filepath.Join(prefix, filepath.Base(src))
+				// Convert back to S3 format (forward slashes)
+				adjustedPrefix = filepath.ToSlash(adjustedPrefix)
+			} else {
+				// Use prefix as is
+				adjustedPrefix = prefix
+			}
+
+			err = uploadPathToS3(client, src, bucket, adjustedPrefix, *concurrency)
 			if err != nil {
 				slog.Info("upload error", "err", err)
 				os.Exit(1)
@@ -161,13 +196,6 @@ func main() {
 		}
 	}
 
-}
-
-// generatePresignedForS3 will generate presigned GET URLs for either a single
-// object (when prefix does not end with '/') or for all objects under a
-// prefix when prefix ends with '/'. It writes one URL per line to stdout.
-func generatePresignedForS3(client *s3.Client, bucket, prefix string, mins int) error {
-	return generatePresignedForS3WithPattern(client, bucket, prefix, "", mins)
 }
 
 // generatePresignedForS3WithPattern will generate presigned GET URLs for objects that match a glob pattern
@@ -209,7 +237,7 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 					// skip directory placeholders
 					continue
 				}
-				
+
 				// If pattern is provided, check if the object key matches the pattern
 				if pattern != "" {
 					relPath := strings.TrimPrefix(*obj.Key, prefix)
@@ -219,12 +247,12 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 						slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
 						continue
 					}
-					
+
 					if !matches {
 						continue
 					}
 				}
-				
+
 				if err := gen(*obj.Key); err != nil {
 					return err
 				}
@@ -251,7 +279,7 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 				slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
 				return err
 			}
-			
+
 			if !matches {
 				return nil // No matches found, return without error
 			}
@@ -278,7 +306,7 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 			if obj.Size != nil && *obj.Size == 0 {
 				continue
 			}
-			
+
 			// If pattern is provided, check if the object key matches the pattern
 			if pattern != "" {
 				relPath := strings.TrimPrefix(*obj.Key, prefix)
@@ -288,12 +316,12 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 					slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
 					continue
 				}
-				
+
 				if !matches {
 					continue
 				}
 			}
-			
+
 			if err := gen(*obj.Key); err != nil {
 				return err
 			}
@@ -333,23 +361,23 @@ func parseS3UrlWithPattern(s string) (bucket, prefix, pattern string, err error)
 	trimmed := strings.TrimPrefix(s, "s3://")
 	parts := strings.SplitN(trimmed, "/", 2)
 	bucket = parts[0]
-	
+
 	if len(parts) > 1 {
 		originalPath := parts[1]
-		
+
 		// Check if the path contains glob patterns
 		if strings.ContainsAny(originalPath, "*?[]{}") {
 			// Extract the directory part and pattern part
 			dir := filepath.Dir(originalPath)
 			pattern = filepath.Base(originalPath)
-			
+
 			// If the directory part is "." then there's no parent directory
 			if dir == "." {
 				prefix = ""
 			} else {
 				prefix = dir
 			}
-			
+
 			// Ensure prefix ends with "/" if it's not empty and doesn't already
 			if prefix != "" && !strings.HasSuffix(prefix, "/") {
 				prefix += "/"
@@ -392,12 +420,12 @@ func listS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern string) 
 				// skip directory placeholders
 				continue
 			}
-			
+
 			key := *obj.Key
 			// Extract the relative path after the prefix
 			relPath := strings.TrimPrefix(key, prefix)
 			relPath = strings.TrimPrefix(relPath, "/")
-			
+
 			// If pattern is provided, check if the relative path matches
 			if pattern != "" {
 				matches, err := filepath.Match(pattern, filepath.Base(relPath))
@@ -405,12 +433,12 @@ func listS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern string) 
 					slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
 					continue
 				}
-				
+
 				if !matches {
 					continue
 				}
 			}
-			
+
 			size := int64(0)
 			if obj.Size != nil {
 				size = *obj.Size
@@ -523,7 +551,7 @@ func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concu
 func downloadS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern, localPath string, concurrency int) error {
 	slog.Info("downloading with pattern", "bucket", bucket, "prefix", prefix, "pattern", pattern, "localPath", localPath, "concurrency", concurrency)
 	ctx := context.TODO()
-	
+
 	// List all objects with the given prefix
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
@@ -554,14 +582,14 @@ func downloadS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern, loc
 			// Extract the relative path after the prefix
 			relPath := strings.TrimPrefix(key, prefix)
 			relPath = strings.TrimPrefix(relPath, "/")
-			
+
 			// Check if the relative path matches the glob pattern
 			matches, err := filepath.Match(pattern, filepath.Base(relPath))
 			if err != nil {
 				slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
 				continue
 			}
-			
+
 			if !matches {
 				slog.Debug("skipping file - doesn't match pattern", "file", relPath, "pattern", pattern)
 				continue
