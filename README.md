@@ -29,6 +29,18 @@ s3cp s3://my-bucket/data/ ./localdir
 s3cp ./localdir s3://my-bucket/data/
 ```
 
+**Download with glob patterns:**
+```
+# Download all CSV files from a directory
+s3cp s3://my-bucket/data/*.csv ./localdir
+
+# Download all gzipped CSV files from a directory
+s3cp s3://my-bucket/data/*.csv.gz ./localdir
+
+# Download all files with a specific pattern from subdirectories
+s3cp s3://my-bucket/data/**/*.csv.gz ./localdir
+```
+
 ### Flags
 
 - `-c <int>`: Set concurrency (default: 4 × number of CPU cores)
@@ -36,6 +48,7 @@ s3cp ./localdir s3://my-bucket/data/
 ## Features
 - Upload local files/directories to S3
 - Download S3 prefixes to local directories
+- Download with glob pattern matching (e.g., `s3cp s3://bucket/dir/*.txt localdir`)
 - Highly concurrent (default: 4 × CPU cores, configurable)
 - Simple, modern logging with timestamps and levels
 - Uses AWS SDK v2 for Go
