@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/lmittmann/tint"
 	"golang.org/x/sync/semaphore"
 )
@@ -220,45 +221,9 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 
 	// If prefix ends with a slash or if there's a pattern, treat as directory and list objects.
 	if strings.HasSuffix(prefix, "/") || prefix == "" || pattern != "" {
-		paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-			Bucket: aws.String(bucket),
-			Prefix: aws.String(prefix),
+		return listS3ObjectsWithPattern(client, bucket, prefix, pattern, func(key string, obj *types.Object) error {
+			return gen(key)
 		})
-		for paginator.HasMorePages() {
-			page, err := paginator.NextPage(ctx)
-			if err != nil {
-				return err
-			}
-			for _, obj := range page.Contents {
-				if obj.Key == nil {
-					continue
-				}
-				if obj.Size != nil && *obj.Size == 0 {
-					// skip directory placeholders
-					continue
-				}
-
-				// If pattern is provided, check if the object key matches the pattern
-				if pattern != "" {
-					relPath := strings.TrimPrefix(*obj.Key, prefix)
-					relPath = strings.TrimPrefix(relPath, "/")
-					matches, err := filepath.Match(pattern, filepath.Base(relPath))
-					if err != nil {
-						slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
-						continue
-					}
-
-					if !matches {
-						continue
-					}
-				}
-
-				if err := gen(*obj.Key); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
 	}
 
 	// Otherwise try to head the object. If it exists, return a single presigned URL.
@@ -289,45 +254,18 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 
 	// If HeadObject failed, fall back to listing objects with the prefix (in
 	// case the user omitted a trailing slash but intended a prefix).
-	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
-	})
 	found := false
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
+	err = listS3ObjectsWithPattern(client, bucket, prefix, pattern, func(key string, obj *types.Object) error {
+		if err := gen(key); err != nil {
 			return err
 		}
-		for _, obj := range page.Contents {
-			if obj.Key == nil {
-				continue
-			}
-			if obj.Size != nil && *obj.Size == 0 {
-				continue
-			}
-
-			// If pattern is provided, check if the object key matches the pattern
-			if pattern != "" {
-				relPath := strings.TrimPrefix(*obj.Key, prefix)
-				relPath = strings.TrimPrefix(relPath, "/")
-				matches, err := filepath.Match(pattern, filepath.Base(relPath))
-				if err != nil {
-					slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
-					continue
-				}
-
-				if !matches {
-					continue
-				}
-			}
-
-			if err := gen(*obj.Key); err != nil {
-				return err
-			}
-			found = true
-		}
+		found = true
+		return nil
+	})
+	if err != nil {
+		return err
 	}
+
 	if !found && pattern != "" {
 		return fmt.Errorf("no objects found matching pattern %s for s3://%s/%s", pattern, bucket, prefix)
 	} else if !found {
@@ -390,23 +328,66 @@ func parseS3UrlWithPattern(s string) (bucket, prefix, pattern string, err error)
 	return
 }
 
-// listS3Prefix prints one s3://bucket/key line per object found under the
-// given prefix. If prefix is an exact object key (no trailing slash) it will
-// attempt a HeadObject and print that single key. If prefix ends with '/' or
-// the HeadObject fails, it will list objects with the prefix and print them.
-func listS3Prefix(client *s3.Client, bucket, prefix string) error {
-	return listS3PrefixWithPattern(client, bucket, prefix, "")
-}
-
 // listS3PrefixWithPattern lists S3 objects that match a glob pattern
 func listS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern string) error {
+
+	found := false
+	err := listS3ObjectsWithPattern(client, bucket, prefix, pattern, func(key string, obj *types.Object) error {
+		size := int64(0)
+		if obj.Size != nil {
+			size = *obj.Size
+		}
+		var lastModTime string
+		if obj.LastModified != nil {
+			lastModTime = obj.LastModified.UTC().Format(time.RFC3339)
+		} else {
+			lastModTime = "-"
+		}
+		fmt.Printf("%s\t%s\ts3://%s/%s\n", lastModTime, humanSize(size), bucket, key)
+		found = true
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		if pattern != "" {
+			return fmt.Errorf("no objects found matching pattern %s for s3://%s/%s", pattern, bucket, prefix)
+		} else {
+			return fmt.Errorf("no objects found for s3://%s/%s", bucket, prefix)
+		}
+	}
+	return nil
+}
+
+// humanSize converts bytes into a human-friendly string using 1024 base.
+func humanSize(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%dB", bytes)
+	}
+	units := []string{"B", "K", "M", "G", "T", "P"}
+	f := float64(bytes)
+	idx := 0
+	for f >= 1024 && idx < len(units)-1 {
+		f /= 1024
+		idx++
+	}
+	return fmt.Sprintf("%.0f%s", f, units[idx])
+}
+
+// listS3ObjectsWithPattern iterates through S3 objects and calls the provided callback function for each object
+// that matches the optional glob pattern. It handles the common logic of listing, filtering, and skipping
+// directory placeholders.
+func listS3ObjectsWithPattern(client *s3.Client, bucket, prefix, pattern string, callback func(key string, obj *types.Object) error) error {
 	ctx := context.TODO()
 
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 		Prefix: aws.String(prefix),
 	})
-	found := false
+
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
@@ -439,200 +420,120 @@ func listS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern string) 
 				}
 			}
 
-			size := int64(0)
-			if obj.Size != nil {
-				size = *obj.Size
+			// Call the callback function for this matching object
+			if err := callback(key, &obj); err != nil {
+				return err
 			}
-			var lastModTime string
-			if obj.LastModified != nil {
-				lastModTime = obj.LastModified.UTC().Format(time.RFC3339)
-			} else {
-				lastModTime = "-"
-			}
-			fmt.Printf("%s\t%s\ts3://%s/%s\n", lastModTime, humanSize(size), bucket, key)
-			found = true
-		}
-	}
-	if !found {
-		if pattern != "" {
-			return fmt.Errorf("no objects found matching pattern %s for s3://%s/%s", pattern, bucket, prefix)
-		} else {
-			return fmt.Errorf("no objects found for s3://%s/%s", bucket, prefix)
 		}
 	}
 	return nil
-}
-
-// humanSize converts bytes into a human-friendly string using 1024 base.
-func humanSize(bytes int64) string {
-	if bytes < 1024 {
-		return fmt.Sprintf("%dB", bytes)
-	}
-	units := []string{"B", "K", "M", "G", "T", "P"}
-	f := float64(bytes)
-	idx := 0
-	for f >= 1024 && idx < len(units)-1 {
-		f /= 1024
-		idx++
-	}
-	return fmt.Sprintf("%.0f%s", f, units[idx])
 }
 
 func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concurrency int) error {
 	slog.Info("downloading", "bucket", bucket, "prefix", prefix, "localPath", localPath, "concurrency", concurrency)
-	ctx := context.TODO()
-	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
-	})
 
 	downloader := manager.NewDownloader(client)
-
 	wg := sync.WaitGroup{}
 	defer wg.Wait()
-
 	sem := semaphore.NewWeighted(int64(concurrency))
 
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			slog.Error("failed to get next page", "err", err)
+	err := listS3ObjectsWithPattern(client, bucket, prefix, "", func(key string, obj *types.Object) error {
+		// Extract the relative path after the prefix
+		relPath := strings.TrimPrefix(key, prefix)
+		relPath = strings.TrimPrefix(relPath, "/")
+		localFile := filepath.Join(localPath, relPath)
+		// slog.Info("preparing to download", "key", key, "prefix", prefix, "relPath", relPath, "localFile", localFile)
+		if err := os.MkdirAll(filepath.Dir(localFile), 0750); err != nil {
+			slog.Error("failed to create directories", "path", filepath.Dir(localFile), "err", err)
 			return err
 		}
-		for _, obj := range page.Contents {
-			slog.Info("found object", "key", *obj.Key, "size", *obj.Size)
-			if *obj.Size == 0 {
-				// skip directories
-				continue
-			}
 
-			relPath := strings.TrimPrefix(*obj.Key, prefix)
-			relPath = strings.TrimPrefix(relPath, "/")
-			localFile := filepath.Join(localPath, relPath)
-			// slog.Info("preparing to download", "key", *obj.Key, "prefix", prefix, "relPath", relPath, "localFile", localFile)
-			if err := os.MkdirAll(filepath.Dir(localFile), 0750); err != nil {
-				slog.Error("failed to create directories", "path", filepath.Dir(localFile), "err", err)
-				return err
-			}
-
-			err = sem.Acquire(ctx, 1)
-			if err != nil {
-				return err
-			}
-			wg.Add(1)
-			go func(bucket, key, destFile string) error {
-				defer wg.Done()
-				defer sem.Release(1)
-				slog.Info("file downloading", "key", key, "file", destFile)
-				f, err := os.Create(destFile)
-				if err != nil {
-					slog.Error("failed to create file", "file", destFile, "err", err)
-					return err
-				}
-				defer f.Close()
-
-				_, err = downloader.Download(ctx, f, &s3.GetObjectInput{
-					Bucket: aws.String(bucket),
-					Key:    aws.String(key),
-				})
-				if err != nil {
-					slog.Error("failed to download", "err", err)
-					return err
-				}
-				slog.Info("file downloaded", "key", *obj.Key, "file", destFile)
-				return nil
-			}(bucket, *obj.Key, localFile)
+		err := sem.Acquire(context.TODO(), 1)
+		if err != nil {
+			return err
 		}
-	}
+		wg.Add(1)
+		go func(bucket, key, destFile string) error {
+			defer wg.Done()
+			defer sem.Release(1)
+			slog.Info("file downloading", "key", key, "file", destFile)
+			f, err := os.Create(destFile)
+			if err != nil {
+				slog.Error("failed to create file", "file", destFile, "err", err)
+				return err
+			}
+			defer f.Close()
 
-	return nil
+			_, err = downloader.Download(context.TODO(), f, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				slog.Error("failed to download", "err", err)
+				return err
+			}
+			slog.Info("file downloaded", "key", key, "file", destFile)
+			return nil
+		}(bucket, key, localFile)
+
+		return nil
+	})
+
+	return err
 }
 
 func downloadS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern, localPath string, concurrency int) error {
 	slog.Info("downloading with pattern", "bucket", bucket, "prefix", prefix, "pattern", pattern, "localPath", localPath, "concurrency", concurrency)
-	ctx := context.TODO()
-
-	// List all objects with the given prefix
-	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
-	})
 
 	downloader := manager.NewDownloader(client)
-
 	wg := sync.WaitGroup{}
 	defer wg.Wait()
-
 	sem := semaphore.NewWeighted(int64(concurrency))
 
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			slog.Error("failed to get next page", "err", err)
+	err := listS3ObjectsWithPattern(client, bucket, prefix, pattern, func(key string, obj *types.Object) error {
+		// Extract the relative path after the prefix
+		relPath := strings.TrimPrefix(key, prefix)
+		relPath = strings.TrimPrefix(relPath, "/")
+
+		localFile := filepath.Join(localPath, relPath)
+		// slog.Info("preparing to download", "key", key, "prefix", prefix, "relPath", relPath, "localFile", localFile)
+		if err := os.MkdirAll(filepath.Dir(localFile), 0750); err != nil {
+			slog.Error("failed to create directories", "path", filepath.Dir(localFile), "err", err)
 			return err
 		}
-		for _, obj := range page.Contents {
-			// Extract the key path relative to the prefix
-			key := *obj.Key
-			if *obj.Size == 0 {
-				// skip directories
-				continue
-			}
 
-			// Extract the relative path after the prefix
-			relPath := strings.TrimPrefix(key, prefix)
-			relPath = strings.TrimPrefix(relPath, "/")
-
-			// Check if the relative path matches the glob pattern
-			matches, err := filepath.Match(pattern, filepath.Base(relPath))
-			if err != nil {
-				slog.Error("failed to match pattern", "pattern", pattern, "file", relPath, "err", err)
-				continue
-			}
-
-			if !matches {
-				slog.Debug("skipping file - doesn't match pattern", "file", relPath, "pattern", pattern)
-				continue
-			}
-
-			localFile := filepath.Join(localPath, relPath)
-			// slog.Info("preparing to download", "key", *obj.Key, "prefix", prefix, "relPath", relPath, "localFile", localFile)
-			if err := os.MkdirAll(filepath.Dir(localFile), 0750); err != nil {
-				slog.Error("failed to create directories", "path", filepath.Dir(localFile), "err", err)
-				return err
-			}
-
-			err = sem.Acquire(ctx, 1)
-			if err != nil {
-				return err
-			}
-			wg.Add(1)
-			go func(bucket, key, destFile string) error {
-				defer wg.Done()
-				defer sem.Release(1)
-				slog.Info("file downloading", "key", key, "file", destFile)
-				f, err := os.Create(destFile)
-				if err != nil {
-					slog.Error("failed to create file", "file", destFile, "err", err)
-					return err
-				}
-				defer f.Close()
-
-				_, err = downloader.Download(ctx, f, &s3.GetObjectInput{
-					Bucket: aws.String(bucket),
-					Key:    aws.String(key),
-				})
-				if err != nil {
-					slog.Error("failed to download", "err", err)
-					return err
-				}
-				slog.Info("file downloaded", "key", key, "file", destFile)
-				return nil
-			}(bucket, key, localFile)
+		err := sem.Acquire(context.TODO(), 1)
+		if err != nil {
+			return err
 		}
-	}
+		wg.Add(1)
+		go func(bucket, key, destFile string) error {
+			defer wg.Done()
+			defer sem.Release(1)
+			slog.Info("file downloading", "key", key, "file", destFile)
+			f, err := os.Create(destFile)
+			if err != nil {
+				slog.Error("failed to create file", "file", destFile, "err", err)
+				return err
+			}
+			defer f.Close()
 
-	return nil
+			_, err = downloader.Download(context.TODO(), f, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				slog.Error("failed to download", "err", err)
+				return err
+			}
+			slog.Info("file downloaded", "key", key, "file", destFile)
+			return nil
+		}(bucket, key, localFile)
+
+		return nil
+	})
+
+	return err
 }
 
 func uploadPathToS3(client *s3.Client, localPath, bucket, prefix string, concurrency int) error {
