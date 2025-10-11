@@ -147,12 +147,9 @@ func main() {
 				adjustedDst = dst
 			}
 
-			// If there's a glob pattern in the source, use the filtered download function
-			if pattern != "" {
-				err = downloadS3PrefixWithPattern(client, bucket, prefix, pattern, adjustedDst, *concurrency)
-			} else {
-				err = downloadS3Prefix(client, bucket, prefix, adjustedDst, *concurrency)
-			}
+			// Use the unified download function with pattern (empty pattern means no filtering)
+			err = downloadS3Prefix(client, bucket, prefix, pattern, adjustedDst, *concurrency)
+		
 
 			if err != nil {
 				slog.Info("download error", "err", err)
@@ -276,19 +273,6 @@ func generatePresignedForS3WithPattern(client *s3.Client, bucket, prefix, patter
 
 func isS3Url(s string) bool {
 	return strings.HasPrefix(s, "s3://")
-}
-
-func parseS3Url(s string) (bucket, prefix string, err error) {
-	if !isS3Url(s) {
-		return "", "", errors.New("not an s3 url")
-	}
-	trimmed := strings.TrimPrefix(s, "s3://")
-	parts := strings.SplitN(trimmed, "/", 2)
-	bucket = parts[0]
-	if len(parts) > 1 {
-		prefix = parts[1]
-	}
-	return
 }
 
 // parseS3UrlWithPattern extracts both the bucket/prefix and any glob pattern from the URL
@@ -429,67 +413,56 @@ func listS3ObjectsWithPattern(client *s3.Client, bucket, prefix, pattern string,
 	return nil
 }
 
-func downloadS3Prefix(client *s3.Client, bucket, prefix, localPath string, concurrency int) error {
-	slog.Info("downloading", "bucket", bucket, "prefix", prefix, "localPath", localPath, "concurrency", concurrency)
-
-	downloader := manager.NewDownloader(client)
-	wg := sync.WaitGroup{}
-	defer wg.Wait()
-	sem := semaphore.NewWeighted(int64(concurrency))
-
-	err := listS3ObjectsWithPattern(client, bucket, prefix, "", func(key string, obj *types.Object) error {
-		// Extract the relative path after the prefix
-		relPath := strings.TrimPrefix(key, prefix)
-		relPath = strings.TrimPrefix(relPath, "/")
-		localFile := filepath.Join(localPath, relPath)
-		// slog.Info("preparing to download", "key", key, "prefix", prefix, "relPath", relPath, "localFile", localFile)
-		if err := os.MkdirAll(filepath.Dir(localFile), 0750); err != nil {
-			slog.Error("failed to create directories", "path", filepath.Dir(localFile), "err", err)
-			return err
-		}
-
-		err := sem.Acquire(context.TODO(), 1)
-		if err != nil {
-			return err
-		}
-		wg.Add(1)
-		go func(bucket, key, destFile string) error {
-			defer wg.Done()
-			defer sem.Release(1)
-			slog.Info("file downloading", "key", key, "file", destFile)
-			f, err := os.Create(destFile)
-			if err != nil {
-				slog.Error("failed to create file", "file", destFile, "err", err)
-				return err
-			}
-			defer f.Close()
-
-			_, err = downloader.Download(context.TODO(), f, &s3.GetObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(key),
-			})
-			if err != nil {
-				slog.Error("failed to download", "err", err)
-				return err
-			}
-			slog.Info("file downloaded", "key", key, "file", destFile)
-			return nil
-		}(bucket, key, localFile)
-
-		return nil
-	})
-
-	return err
+// downloadTask represents a single file download task
+type downloadTask struct {
+	bucket   string
+	key      string
+	destFile string
 }
 
-func downloadS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern, localPath string, concurrency int) error {
-	slog.Info("downloading with pattern", "bucket", bucket, "prefix", prefix, "pattern", pattern, "localPath", localPath, "concurrency", concurrency)
+func downloadS3Prefix(client *s3.Client, bucket, prefix, pattern, localPath string, concurrency int) error {
+	if pattern != "" {
+		slog.Info("downloading with pattern", "bucket", bucket, "prefix", prefix, "pattern", pattern, "localPath", localPath, "concurrency", concurrency)
+	} else {
+		slog.Info("downloading", "bucket", bucket, "prefix", prefix, "localPath", localPath, "concurrency", concurrency)
+	}
 
 	downloader := manager.NewDownloader(client)
-	wg := sync.WaitGroup{}
-	defer wg.Wait()
-	sem := semaphore.NewWeighted(int64(concurrency))
+	
+	// Create the worker pool
+	tasks := make(chan downloadTask, concurrency*2) // buffered channel to allow some queueing
+	
+	var wg sync.WaitGroup
+	// Start workers
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				slog.Info("file downloading", "key", task.key, "file", task.destFile)
+				f, err := os.Create(task.destFile)
+				if err != nil {
+					slog.Error("failed to create file", "file", task.destFile, "err", err)
+					continue
+				}
+				
+				_, err = downloader.Download(context.TODO(), f, &s3.GetObjectInput{
+					Bucket: aws.String(task.bucket),
+					Key:    aws.String(task.key),
+				})
+				if err != nil {
+					slog.Error("failed to download", "err", err)
+					f.Close()
+					continue
+				}
+				
+				slog.Info("file downloaded", "key", task.key, "file", task.destFile)
+				f.Close()
+			}
+		}()
+	}
 
+	// Send download tasks to the worker pool
 	err := listS3ObjectsWithPattern(client, bucket, prefix, pattern, func(key string, obj *types.Object) error {
 		// Extract the relative path after the prefix
 		relPath := strings.TrimPrefix(key, prefix)
@@ -502,36 +475,21 @@ func downloadS3PrefixWithPattern(client *s3.Client, bucket, prefix, pattern, loc
 			return err
 		}
 
-		err := sem.Acquire(context.TODO(), 1)
-		if err != nil {
-			return err
+		// Send task to worker pool
+		tasks <- downloadTask{
+			bucket:   bucket,
+			key:      key,
+			destFile: localFile,
 		}
-		wg.Add(1)
-		go func(bucket, key, destFile string) error {
-			defer wg.Done()
-			defer sem.Release(1)
-			slog.Info("file downloading", "key", key, "file", destFile)
-			f, err := os.Create(destFile)
-			if err != nil {
-				slog.Error("failed to create file", "file", destFile, "err", err)
-				return err
-			}
-			defer f.Close()
-
-			_, err = downloader.Download(context.TODO(), f, &s3.GetObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(key),
-			})
-			if err != nil {
-				slog.Error("failed to download", "err", err)
-				return err
-			}
-			slog.Info("file downloaded", "key", key, "file", destFile)
-			return nil
-		}(bucket, key, localFile)
 
 		return nil
 	})
+
+	// Close the tasks channel to signal workers to finish
+	close(tasks)
+	
+	// Wait for all workers to finish
+	wg.Wait()
 
 	return err
 }
